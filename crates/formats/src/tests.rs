@@ -200,6 +200,27 @@ fn odt_round_trip() {
 }
 
 #[test]
+fn latex_round_trip() {
+    check_round_trip("tex", true);
+    let tex = String::from_utf8(export("tex", &sample()).unwrap().unwrap()).unwrap();
+    assert!(tex.starts_with("% Written by WordCraft") && tex.contains("\\documentclass{article}"), "{tex}");
+    assert!(tex.contains("\\section*{Main Heading}") && tex.contains("\\subsection*{Second Level}"), "{tex}");
+    assert!(tex.contains("\\textbf{bold}") && tex.contains("\\textit{italic}"), "{tex}");
+    assert!(tex.contains("\\href{https://example.com/x}{a link}"), "{tex}");
+    assert!(tex.contains("\\begin{itemize}") && tex.contains("\\begin{enumerate}") && tex.contains("\\begin{quote}"), "{tex}");
+    assert!(tex.contains("\\begin{tabular}") && tex.contains("\\begin{center}"), "{tex}");
+    assert!(tex.contains("\\textit{[Picture: tiny]}"), "pictures leave their alternative text: {tex}");
+    assert!(tex.contains("pdftitle={Sample Title}") && tex.contains("pdfauthor={Ada Writer}"), "{tex}");
+    assert!(tex.trim_end().ends_with("\\end{document}"));
+    // Exported LaTeX parses back to the same metadata.
+    let back = import("tex", tex.as_bytes()).unwrap().unwrap();
+    assert_eq!(back.core.title, "", "pdftitle isn't \\title");
+    for ext in ["tex", "latex", "ltx", ".TEX"] {
+        assert!(import(ext, b"x").is_some() && export(ext, &Document::new()).is_some(), "{ext}");
+    }
+}
+
+#[test]
 fn txt_round_trip() {
     check_round_trip("txt", false);
     let d = import("txt", "a\r\nb\nc".as_bytes()).unwrap().unwrap();
@@ -259,7 +280,7 @@ fn code_blocks_and_rules() {
     assert!(matches!(&b[0], FBlock::Para(p) if p.kind == Kind::Code && p.text() == "fn main() {}"));
     assert!(matches!(&b[1], FBlock::Para(p) if p.kind == Kind::Code && p.text() == "  indented"));
     assert!(matches!(&b[2], FBlock::Para(p) if p.kind == Kind::Rule));
-    for ext in ["md", "html", "rtf", "odt"] {
+    for ext in ["md", "html", "rtf", "odt", "tex"] {
         let back = import(ext, &export(ext, &d).unwrap().unwrap()).unwrap().unwrap();
         let bb = flat(&back);
         assert!(bb.iter().any(|x| matches!(x, FBlock::Para(p) if p.kind == Kind::Code && p.text() == "  indented")), "{ext}: {bb:?}");
@@ -283,6 +304,14 @@ fn deep_nesting_is_bounded() {
     assert!(import("md", md.as_bytes()).unwrap().is_ok());
     let md = "*a ".repeat(20_000);
     assert!(import("md", md.as_bytes()).unwrap().is_ok());
+    let tex = "{\\textbf{".repeat(50_000) + "x";
+    assert!(import("tex", tex.as_bytes()).unwrap().unwrap().plain_text(Default::default()).contains('x'));
+    let tex = "\\begin{itemize}\\item ".repeat(10_000) + "deep";
+    assert!(import("tex", tex.as_bytes()).unwrap().unwrap().plain_text(Default::default()).contains("deep"));
+    let tex = "\\begin{tabular}{l}".repeat(2_000) + "cell";
+    assert!(import("tex", tex.as_bytes()).unwrap().is_ok());
+    let tex = format!("${}x{}$", "\\frac{".repeat(10_000), "}".repeat(10_000));
+    assert!(import("tex", tex.as_bytes()).unwrap().is_ok());
 }
 
 #[test]
@@ -297,7 +326,7 @@ fn garbage_never_panics() {
                 seed as u8
             })
             .collect();
-        for ext in ["txt", "md", "html", "rtf", "odt"] {
+        for ext in ["txt", "md", "html", "rtf", "odt", "tex"] {
             let _ = import(ext, &bytes);
         }
         let mut rtf = b"{\\rtf1".to_vec();
@@ -348,6 +377,22 @@ proptest::proptest! {
         let src = format!("{{\\rtf1 {s}");
         let d = import("rtf", src.as_bytes()).unwrap().unwrap();
         let _ = export("rtf", &d).unwrap().unwrap();
+    }
+
+    #[test]
+    fn fuzz_latex(s in "(\\\\(begin|end)\\{(itemize|tabular|verbatim|quote|center|x)\\}|\\\\[a-zA-Z]{1,8}\\*?|\\\\[^a-zA-Z]|[{}\\[\\]$&%~^_#]|\n\n|[a-z ]){0,150}") {
+        let d = import("tex", s.as_bytes()).unwrap().unwrap();
+        let _ = export("tex", &d).unwrap().unwrap();
+    }
+
+    #[test]
+    fn latex_text_round_trips(words in proptest::collection::vec("[a-zA-Z0-9{}$&%#_~^\\\\<>|`'.!-]{1,8}", 1..8)) {
+        let text = words.join(" ");
+        let d = Document::from_text(&text);
+        let tex = export("tex", &d).unwrap().unwrap();
+        let back = import("tex", &tex).unwrap().unwrap();
+        let got = back.plain_text(Default::default());
+        proptest::prop_assert_eq!(got.trim(), text.trim(), "tex: {}", String::from_utf8_lossy(&tex));
     }
 
     #[test]

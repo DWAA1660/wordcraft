@@ -1111,7 +1111,8 @@ fn text_html(t: &str) -> String {
 /// Inline spans → HTML.
 pub fn inlines_html(inlines: &[Inline]) -> String {
     let mut o = String::new();
-    for i in inlines {
+    let inlines = crate::model::equations_as_text(inlines);
+    for i in inlines.iter() {
         match i {
             Inline::Text(t, f) => {
                 let mut open = String::new();
@@ -1178,6 +1179,7 @@ pub fn inlines_html(inlines: &[Inline]) -> String {
                 ));
             }
             Inline::Anchor(a) => o.push_str(&format!("<a id=\"{}\"></a>", esc(a))),
+            Inline::Equation { .. } => {}
         }
     }
     o
