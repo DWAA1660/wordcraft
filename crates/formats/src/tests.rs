@@ -312,6 +312,18 @@ fn deep_nesting_is_bounded() {
     assert!(import("tex", tex.as_bytes()).unwrap().is_ok());
     let tex = format!("${}x{}$", "\\frac{".repeat(10_000), "}".repeat(10_000));
     assert!(import("tex", tex.as_bytes()).unwrap().is_ok());
+    // `*{n}{…}` column specs: nested 100k deep (the repeat recursed without a limit and overflowed
+    // the stack), and repeats multiplying past what a table holds (64^30 columns).
+    let tex = format!("\\begin{{tabular}}{{{}l{}}}x\\end{{tabular}}", "*{1}{".repeat(100_000), "}".repeat(100_000));
+    assert!(import("tex", tex.as_bytes()).unwrap().unwrap().plain_text(Default::default()).contains('x'));
+    let tex = format!("\\begin{{tabular}}{{{}p{{1cm}}{}}}x\\end{{tabular}}", "*{64}{".repeat(30), "}".repeat(30));
+    assert!(import("tex", tex.as_bytes()).unwrap().unwrap().plain_text(Default::default()).contains('x'));
+    // An equation of unmatched `(`: finding each group rescanned to the end of the input, so
+    // exporting it was quadratic (50k took seconds; 200k would take minutes).
+    let started = std::time::Instant::now();
+    let latex = crate::latex::linear_to_latex(&"(".repeat(200_000));
+    assert_eq!(latex.len(), 200_000);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
 }
 
 #[test]

@@ -25,6 +25,8 @@ use wordcraft_doc::{Align, Document, Rgb};
 pub const MAX_SOURCE: usize = 32 << 20;
 /// Nesting limit for groups, environments and arguments (hostile input).
 const MAX_NEST: usize = 32;
+/// Longest `tabular` column spec read (characters); the rest is ignored.
+const MAX_SPEC: usize = 4096;
 /// Text width of the exported article in points (`\linewidth` when reading widths).
 const LINE_WIDTH: f32 = 345.0;
 /// LaTeX's `\tabcolsep` (both sides of a cell), points.
@@ -607,23 +609,29 @@ fn math_symbol(name: &str) -> Option<char> {
     MATH_SYMBOLS.iter().find(|(_, n)| *n == name).map(|(c, _)| *c).or_else(|| MATH_ALIASES.iter().find(|(n, _)| *n == name).map(|(_, c)| *c))
 }
 
-/// The balanced group starting at `open` (`(`, `{`): its content and the index after it.
-fn balanced(chars: &[char], open: usize, l: char, r: char) -> Option<(String, usize)> {
-    if chars.get(open) != Some(&l) {
-        return None;
-    }
-    let mut depth = 0usize;
-    for (i, c) in chars.iter().enumerate().skip(open) {
+/// For every `l` in `chars`, the index of the `r` that closes it, found in one stack pass.
+/// Looking groups up here keeps scanning linear: rescanning to the end of the input for every
+/// unmatched `(` made long equations quadratic.
+fn closers(chars: &[char], l: char, r: char) -> Vec<Option<usize>> {
+    let mut out = vec![None; chars.len()];
+    let mut open = Vec::new();
+    for (i, c) in chars.iter().enumerate() {
         if *c == l {
-            depth += 1;
-        } else if *c == r {
-            depth -= 1;
-            if depth == 0 {
-                return Some((chars.get(open + 1..i).unwrap_or_default().iter().collect(), i + 1));
-            }
+            open.push(i);
+        } else if *c == r
+            && let Some(o) = open.pop()
+            && let Some(slot) = out.get_mut(o)
+        {
+            *slot = Some(i);
         }
     }
-    None
+    out
+}
+
+/// The balanced group opening at `open` (see [`closers`]): its content and the index after it.
+fn balanced(chars: &[char], closers: &[Option<usize>], open: usize) -> Option<(String, usize)> {
+    let close = (*closers.get(open)?)?;
+    Some((chars.get(open + 1..close).unwrap_or_default().iter().collect(), close + 1))
 }
 
 /// A linear-format equation as LaTeX math.
@@ -633,15 +641,16 @@ pub fn linear_to_latex(linear: &str) -> String {
 
 fn linear_to_latex_at(linear: &str, depth: usize) -> String {
     let chars: Vec<char> = linear.chars().collect();
+    let parens = closers(&chars, '(', ')');
     let mut o = String::new();
     let mut i = 0;
     let sub = |s: &str| if depth < MAX_NEST { linear_to_latex_at(s, depth + 1) } else { escape_math_text(s) };
     while let Some(&c) = chars.get(i) {
         // (a)/(b) → \frac{a}{b}
         if c == '('
-            && let Some((num, after)) = balanced(&chars, i, '(', ')')
+            && let Some((num, after)) = balanced(&chars, &parens, i)
             && chars.get(after) == Some(&'/')
-            && let Some((den, end)) = balanced(&chars, after + 1, '(', ')')
+            && let Some((den, end)) = balanced(&chars, &parens, after + 1)
         {
             o.push_str(&format!("\\frac{{{}}}{{{}}}", sub(&num), sub(&den)));
             i = end;
@@ -650,7 +659,7 @@ fn linear_to_latex_at(linear: &str, depth: usize) -> String {
         match c {
             '^' | '_' => {
                 o.push(c);
-                match balanced(&chars, i + 1, '(', ')') {
+                match balanced(&chars, &parens, i + 1) {
                     Some((inner, end)) => {
                         o.push_str(&format!("{{{}}}", sub(&inner)));
                         i = end;
@@ -660,7 +669,7 @@ fn linear_to_latex_at(linear: &str, depth: usize) -> String {
                 continue;
             }
             '√' => {
-                match balanced(&chars, i + 1, '(', ')') {
+                match balanced(&chars, &parens, i + 1) {
                     Some((inner, end)) => {
                         match inner.split_once('&') {
                             Some((n, x)) => o.push_str(&format!("\\sqrt[{}]{{{}}}", sub(n), sub(x))),
@@ -1056,8 +1065,12 @@ impl Lexer<'_> {
             return None;
         }
         self.bump();
+        let Some(end) = self.rest().find('}').filter(|e| *e <= 64) else {
+            // Unclosed or overlong: leave the `{` to be read as ordinary input.
+            self.i = save;
+            return None;
+        };
         let r = self.rest();
-        let end = r.find('}').filter(|e| *e <= 64)?;
         let name = r.get(..end).unwrap_or("").trim().to_string();
         self.i += end + 1;
         Some(name)
@@ -1612,7 +1625,17 @@ fn length_pt(s: &str) -> Option<f32> {
 
 /// Column widths of a `tabular` column spec, when every column has one (`p{3cm}`).
 fn spec_widths(spec: &str) -> (usize, Vec<f32>) {
+    let (cols, widths) = spec_widths_at(spec, 0);
+    (cols.min(wordcraft_doc::table::MAX_COLS), if widths.len() == cols { widths } else { Vec::new() })
+}
+
+/// [`spec_widths`] at nesting `depth` of `*{n}{…}` repeats. The column count saturates and the
+/// widths stop growing past [`wordcraft_doc::table::MAX_COLS`], so nested repeats can't overflow
+/// or exhaust memory; the returned widths are empty unless every column has one.
+fn spec_widths_at(spec: &str, depth: usize) -> (usize, Vec<f32>) {
+    let max_cols = wordcraft_doc::table::MAX_COLS;
     let chars: Vec<char> = spec.chars().collect();
+    let braces = closers(&chars, '{', '}');
     let mut cols = 0usize;
     let mut widths = Vec::new();
     let mut all = true;
@@ -1620,15 +1643,16 @@ fn spec_widths(spec: &str) -> (usize, Vec<f32>) {
     while let Some(&c) = chars.get(i) {
         match c {
             'l' | 'c' | 'r' | 'X' | 'S' | 'L' | 'C' | 'R' | 'J' => {
-                cols += 1;
+                cols = cols.saturating_add(1);
                 all = false;
             }
             'p' | 'm' | 'b' => {
-                cols += 1;
-                match balanced(&chars, i + 1, '{', '}') {
+                cols = cols.saturating_add(1);
+                match balanced(&chars, &braces, i + 1) {
                     Some((w, end)) => {
                         match length_pt(&w) {
-                            Some(v) => widths.push(v + 2.0 * TABCOLSEP),
+                            Some(v) if widths.len() < max_cols => widths.push(v + 2.0 * TABCOLSEP),
+                            Some(_) => {}
                             None => all = false,
                         }
                         i = end;
@@ -1638,16 +1662,23 @@ fn spec_widths(spec: &str) -> (usize, Vec<f32>) {
                 }
             }
             '*' => {
-                // `*{3}{l}`: repeat.
-                if let Some((n, end)) = balanced(&chars, i + 1, '{', '}')
-                    && let Some((inner, end2)) = balanced(&chars, end, '{', '}')
+                // `*{3}{l}`: repeat. Past the nesting limit the repeat is skipped, unmeasured.
+                if let Some((n, end)) = balanced(&chars, &braces, i + 1)
+                    && let Some((inner, end2)) = balanced(&chars, &braces, end)
                 {
-                    let n: usize = n.trim().parse().unwrap_or(1).min(64);
-                    let (c2, w2) = spec_widths(&inner);
-                    cols += c2 * n;
-                    if w2.len() == c2 {
-                        for _ in 0..n {
-                            widths.extend(&w2);
+                    if depth < MAX_NEST {
+                        let n: usize = n.trim().parse().unwrap_or(1).min(64);
+                        let (c2, w2) = spec_widths_at(&inner, depth + 1);
+                        cols = cols.saturating_add(c2.saturating_mul(n));
+                        if w2.len() == c2 {
+                            for _ in 0..n {
+                                if widths.len() >= max_cols {
+                                    break;
+                                }
+                                widths.extend(w2.iter().take(max_cols - widths.len()));
+                            }
+                        } else {
+                            all = false;
                         }
                     } else {
                         all = false;
@@ -1658,7 +1689,7 @@ fn spec_widths(spec: &str) -> (usize, Vec<f32>) {
             }
             '@' | '!' | '>' | '<' => {
                 // `@{…}`, `>{…}`: skip the argument.
-                if let Some((_, end)) = balanced(&chars, i + 1, '{', '}') {
+                if let Some((_, end)) = balanced(&chars, &braces, i + 1) {
                     i = end;
                     continue;
                 }
@@ -1667,7 +1698,7 @@ fn spec_widths(spec: &str) -> (usize, Vec<f32>) {
         }
         i += 1;
     }
-    (cols.min(wordcraft_doc::table::MAX_COLS), if all && widths.len() == cols { widths } else { Vec::new() })
+    (cols, if all && widths.len() == cols { widths } else { Vec::new() })
 }
 
 /// Paragraph-level context from the enclosing environments.
@@ -2325,7 +2356,8 @@ impl<'a> Parser<'a> {
                 if matches!(name, "tabular*" | "tabularx" | "tabulary") {
                     let _ = self.arg_raw();
                 }
-                let spec = self.arg_source();
+                // A real column spec is short; capping it bounds the work on hostile input.
+                let spec: String = self.arg_source().chars().take(MAX_SPEC).collect();
                 let toks = self.until_end(name);
                 self.flush();
                 let t = table(toks, &spec, self.depth);
@@ -2667,6 +2699,29 @@ mod tests {
 
     fn texts(src: &str) -> Vec<String> {
         paras(src).iter().map(|p| p.text()).collect()
+    }
+
+    #[test]
+    fn unclosed_begin_keeps_its_brace() {
+        // `env_name` used to consume the `{` before giving up on a missing `}`.
+        let toks = tokenize("\\begin{ x");
+        assert_eq!(toks.first(), Some(&Tok::Cmd("begin".into())), "{toks:?}");
+        assert!(toks.contains(&Tok::Open), "{toks:?}");
+        let toks = tokenize(&format!("\\end{{{}}}", "n".repeat(100)));
+        assert!(toks.contains(&Tok::Open), "{toks:?}");
+    }
+
+    #[test]
+    fn spec_widths_repeats_are_bounded() {
+        assert_eq!(spec_widths("*{3}{p{1cm}}").0, 3);
+        assert_eq!(spec_widths("*{2}{*{2}{l}}").0, 4);
+        let deep = format!("{}l{}", "*{1}{".repeat(MAX_NEST + 5), "}".repeat(MAX_NEST + 5));
+        let (cols, widths) = spec_widths(&deep);
+        assert!(cols <= wordcraft_doc::table::MAX_COLS && widths.is_empty());
+        let wide = format!("{}p{{1cm}}{}", "*{64}{".repeat(30), "}".repeat(30));
+        let (cols, widths) = spec_widths(&wide);
+        assert_eq!(cols, wordcraft_doc::table::MAX_COLS);
+        assert!(widths.len() <= wordcraft_doc::table::MAX_COLS);
     }
 
     const ARTICLE: &str = r#"\documentclass[11pt]{article}
