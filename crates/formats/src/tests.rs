@@ -324,6 +324,65 @@ fn deep_nesting_is_bounded() {
     let latex = crate::latex::linear_to_latex(&"(".repeat(200_000));
     assert_eq!(latex.len(), 200_000);
     assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    // Brackets that do match, nested 100k deep: each group was copied out before looking for
+    // the `/` of a fraction, which was quadratic as well.
+    let started = std::time::Instant::now();
+    let nested = format!("{}x{}", "(".repeat(100_000), ")".repeat(100_000));
+    assert_eq!(crate::latex::linear_to_latex(&nested).len(), 200_001);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(crate::latex::linear_to_latex("(a)/(b)"), "\\frac{a}{b}");
+    assert_eq!(crate::latex::linear_to_latex("((a)/(b))/(c)"), "\\frac{\\frac{a}{b}}{c}");
+    // `\begin{` never closed: the name was looked for through the whole rest of the file.
+    let started = std::time::Instant::now();
+    let tex = "\\begin{".repeat(300_000);
+    assert!(import("tex", tex.as_bytes()).unwrap().is_ok());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+/// What a document says in an equation or a bookmark name is not written to the exported file as
+/// TeX commands: compiling the export must not read files or run programs the document names.
+#[test]
+fn latex_export_carries_no_commands_from_the_document() {
+    let tex = crate::latex::linear_to_latex("\\input secret.txt \\immediate\\write18\\bgroup id\\egroup \\csname x\\endcsname");
+    for cmd in ["\\input", "\\immediate", "\\write", "\\bgroup", "\\egroup", "\\csname", "\\endcsname"] {
+        assert!(!tex.contains(cmd), "{cmd} in {tex}");
+    }
+    assert!(tex.contains("\\backslash input"), "{tex}");
+    // `^^5c` is how TeX spells a backslash: two carets never come out side by side.
+    for linear in ["a^^5cinput secret.txt ", "a^^^^5cinput", "x^(^^5cinput)", "^^5cinput"] {
+        assert!(!crate::latex::linear_to_latex(linear).contains("^^"), "{linear}");
+    }
+    let deep = format!("{}^^5cinput x{}", "x^(".repeat(40), ")".repeat(40));
+    assert!(!crate::latex::linear_to_latex(&deep).contains("^^"));
+    // Symbols, functions and font switches are still commands.
+    assert_eq!(crate::latex::linear_to_latex("\\alpha+\\sin x+\\mathbb R"), "\\alpha+\\sin x+\\mathbb R");
+    assert_eq!(crate::latex::linear_to_latex("x^2^3"), "x^2^3");
+    // The same through a whole file, and for a bookmark name.
+    let d = crate::latex::import("Text $\\input secret.txt $ and \\hypertarget{^^5cinput secret.txt ^^5c}{here}.".as_bytes());
+    let out = String::from_utf8(export("tex", &d).unwrap().unwrap()).unwrap();
+    assert!(!out.contains("\\input") && !out.contains("^^"), "{out}");
+}
+
+/// Many labels in a row, with or without spaces between, are read in linear time (looking back
+/// past them for the last text made a megabyte of labels take tens of seconds), and labels
+/// separated by text are all kept.
+#[test]
+fn latex_labels_in_a_row_are_read_in_linear_time() {
+    let started = std::time::Instant::now();
+    for src in ["\\label{a} ".repeat(100_000) + "x", "\\label{a}".repeat(100_000) + "x", "\\hypertarget{a}{} ".repeat(100_000)] {
+        let d = crate::latex::import(src.as_bytes());
+        assert!(d.body.len() <= 2);
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    let d = crate::latex::import("\\label{one}First \\label{two}second \\label{three}third.".as_bytes());
+    let p = d.para_at(&wordcraft_doc::Pos::body(0, 0)).unwrap();
+    let names: Vec<&str> = p
+        .objects
+        .iter()
+        .filter_map(|o| if let wordcraft_doc::InlineObject::BookmarkStart { name } = o { Some(name.as_str()) } else { None })
+        .collect();
+    assert_eq!(names, ["one", "two", "three"]);
+    assert_eq!(d.plain_text(wordcraft_doc::StoryRef::Body).replace('\u{FFFC}', ""), "First second third.");
 }
 
 #[test]

@@ -27,6 +27,8 @@ pub const MAX_SOURCE: usize = 32 << 20;
 const MAX_NEST: usize = 32;
 /// Longest `tabular` column spec read (characters); the rest is ignored.
 const MAX_SPEC: usize = 4096;
+/// Most bookmarks kept in a row with no text between them.
+const MAX_ANCHOR_RUN: usize = 64;
 /// Text width of the exported article in points (`\linewidth` when reading widths).
 const LINE_WIDTH: f32 = 345.0;
 /// LaTeX's `\tabcolsep` (both sides of a cell), points.
@@ -440,6 +442,10 @@ pub fn escape_text(s: &str) -> String {
 fn escape_url(s: &str) -> String {
     let mut o = String::new();
     for c in s.chars().filter(|c| !c.is_control()) {
+        // Never `^^`: TeX reads `^^5c` as a backslash, which would start a command.
+        if c == '^' && o.ends_with('^') {
+            continue;
+        }
         if matches!(c, '%' | '#' | '\\' | '{' | '}') {
             o.push('\\');
         }
@@ -605,6 +611,37 @@ const MATH_FUNCTIONS: &[&str] = &[
     "liminf", "limsup", "min", "max", "sup", "inf", "det", "dim", "gcd", "deg", "arg", "ker", "Pr", "hom",
 ];
 
+/// Control words an exported equation may carry besides the symbols and functions above (font
+/// switches, delimiters, spacing).
+const MATH_COMMANDS: &[&str] = &[
+    "mathbb",
+    "mathbf",
+    "mathcal",
+    "mathfrak",
+    "mathit",
+    "mathrm",
+    "mathsf",
+    "mathtt",
+    "boldsymbol",
+    "left",
+    "right",
+    "quad",
+    "qquad",
+    "displaystyle",
+    "textstyle",
+    "limits",
+    "nolimits",
+    "not",
+];
+
+/// May `\\name` from an equation's text be written to the exported file as a command? Only the
+/// names known here. An equation's text comes from the document (a file someone else may have
+/// made), and `\\input`, `\\write` or `\\def` in it would act on the machine of whoever compiles
+/// the export.
+fn known_math_command(name: &str) -> bool {
+    math_symbol(name).is_some() || MATH_FUNCTIONS.contains(&name) || MATH_COMMANDS.contains(&name)
+}
+
 fn math_symbol(name: &str) -> Option<char> {
     MATH_SYMBOLS.iter().find(|(_, n)| *n == name).map(|(c, _)| *c).or_else(|| MATH_ALIASES.iter().find(|(n, _)| *n == name).map(|(_, c)| *c))
 }
@@ -647,9 +684,12 @@ fn linear_to_latex_at(linear: &str, depth: usize) -> String {
     let sub = |s: &str| if depth < MAX_NEST { linear_to_latex_at(s, depth + 1) } else { escape_math_text(s) };
     while let Some(&c) = chars.get(i) {
         // (a)/(b) → \frac{a}{b}
+        // (The `/` is looked for before the group is copied out: copying every group of a deeply
+        // nested equation only to find no `/` after it was quadratic.)
         if c == '('
+            && let Some(Some(close)) = parens.get(i)
+            && chars.get(close + 1) == Some(&'/')
             && let Some((num, after)) = balanced(&chars, &parens, i)
-            && chars.get(after) == Some(&'/')
             && let Some((den, end)) = balanced(&chars, &parens, after + 1)
         {
             o.push_str(&format!("\\frac{{{}}}{{{}}}", sub(&num), sub(&den)));
@@ -658,6 +698,10 @@ fn linear_to_latex_at(linear: &str, depth: usize) -> String {
         }
         match c {
             '^' | '_' => {
+                // Never `^^`: TeX reads `^^5c` as a backslash, which would start a command.
+                if c == '^' && o.ends_with('^') {
+                    o.push_str("{}");
+                }
                 o.push(c);
                 match balanced(&chars, &parens, i + 1) {
                     Some((inner, end)) => {
@@ -690,6 +734,11 @@ fn linear_to_latex_at(linear: &str, depth: usize) -> String {
                 if name.is_empty() {
                     o.push_str("\\backslash ");
                     i += 1;
+                } else if !known_math_command(&name) {
+                    // Not a command we know: written as the text it is.
+                    o.push_str("\\backslash ");
+                    o.push_str(&name);
+                    i += 1 + name.len();
                 } else {
                     o.push('\\');
                     o.push_str(&name);
@@ -726,7 +775,15 @@ fn linear_to_latex_at(linear: &str, depth: usize) -> String {
 }
 
 fn escape_math_text(s: &str) -> String {
-    s.chars().filter(|c| !matches!(c, '{' | '}' | '\\' | '$' | '%' | '#' | '&') && !c.is_control()).collect()
+    let mut o = String::new();
+    for c in s.chars().filter(|c| !matches!(c, '{' | '}' | '\\' | '$' | '%' | '#' | '&') && !c.is_control()) {
+        // Never `^^` (see `linear_to_latex_at`).
+        if c == '^' && o.ends_with('^') {
+            continue;
+        }
+        o.push(c);
+    }
+    o
 }
 
 /// LaTeX math as a linear-format equation.
@@ -1065,7 +1122,9 @@ impl Lexer<'_> {
             return None;
         }
         self.bump();
-        let Some(end) = self.rest().find('}').filter(|e| *e <= 64) else {
+        // Only the next 65 bytes are searched: looking through the rest of the file for a `}`
+        // made a run of unclosed `\\begin{` quadratic.
+        let Some(end) = self.rest().bytes().take(65).position(|b| b == b'}') else {
             // Unclosed or overlong: leave the `{` to be read as ordinary input.
             self.i = save;
             return None;
@@ -1756,6 +1815,17 @@ impl<'a> Parser<'a> {
         self.ctx
     }
 
+    /// A bookmark here. `text` looks back past the bookmarks that end the paragraph to see what
+    /// the last text was, so a run of them with nothing between is kept short: after
+    /// [`MAX_ANCHOR_RUN`] in a row further ones are left out (thousands of labels with no text
+    /// between them made reading a file take time quadratic in its size).
+    fn anchor(&mut self, name: String) {
+        let run = self.para.inlines.iter().rev().take(MAX_ANCHOR_RUN).take_while(|i| matches!(i, Inline::Anchor(_))).count();
+        if run < MAX_ANCHOR_RUN {
+            self.para.inlines.push(Inline::Anchor(name));
+        }
+    }
+
     fn text(&mut self, s: &str) {
         // Spaces collapse, and none start a paragraph (as in TeX).
         let after_space = match self.para.inlines.iter().rev().find(|i| !matches!(i, Inline::Anchor(_))) {
@@ -2224,12 +2294,12 @@ impl<'a> Parser<'a> {
             }
             "hypertarget" => {
                 let target = self.arg_raw();
-                self.para.inlines.push(Inline::Anchor(target));
+                self.anchor(target);
                 self.with_arg(|_| {});
             }
             "label" => {
                 let l = self.arg_raw();
-                self.para.inlines.push(Inline::Anchor(l));
+                self.anchor(l);
             }
             "ref" | "eqref" | "pageref" | "autoref" | "cref" | "Cref" | "nameref" => {
                 let l = self.arg_raw();
